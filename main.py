@@ -4,16 +4,53 @@ import subprocess
 import json
 import argparse
 import tempfile
+import platform
 from groq import Groq
 
 GROQ_API_KEY = "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"
 
-def extract_audio(video_path, audio_path):
-    # 使用 ffmpeg 提取音频
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-acodec", "mp3", audio_path
-    ]
+
+
+def get_ffmpeg_hwaccel_args(no_hwaccel=False):
+    """获取硬件加速参数
+    - Linux/Windows: 使用GPU加速
+    - macOS: 使用VideoToolbox(MIPS加速)
+    """
+    if no_hwaccel:
+        return []
+
+    system = platform.system()
+    if system == "Linux":
+        # Linux系统使用AMD/NVIDIA/Intel GPU加速
+        return ["-hwaccel", "auto"]
+    elif system == "Windows":
+        # Windows系统使用GPU加速
+        return ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+    elif system == "Darwin":  # macOS
+        # macOS使用VideoToolbox硬件加速
+        return ["-hwaccel", "videotoolbox"]
+    else:
+        # 其他系统不启用硬件加速
+        return []
+
+def test_ffmpeg_hwaccel():
+    """测试ffmpeg硬件加速是否可用"""
+    try:
+        # 尝试使用硬件加速执行一个简单的命令
+        test_cmd = ["ffmpeg", "-hwaccels"]
+        result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and "videotoolbox" in result.stdout or "cuda" in result.stdout or "qsv" in result.stdout:
+            return True
+    except:
+        pass
+    return False
+
+def extract_audio(video_path, audio_path, no_hwaccel=False):
+    # 使用 ffmpeg 提取音频（可选择硬件加速）
+    hwaccel_args = get_ffmpeg_hwaccel_args(no_hwaccel)
+    cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", video_path]
+    # 音频处理不使用硬件加速以保证兼容性
+    cmd.extend(["-vn", "-acodec", "mp3", "-q:a", "2", audio_path])
     subprocess.run(cmd, check=True)
 
 def transcribe(audio_path):
@@ -45,7 +82,7 @@ def save_srt(transcription, srt_path):
             text = seg["text"].strip()
             f.write(f"{idx}\n{start} --> {end}\n{text}\n\n")
 
-def burn_subtitles(video_path, srt_path, out_path):
+def burn_subtitles(video_path, srt_path, out_path, no_hwaccel=False):
     """使用 ffmpeg 将 SRT 烧录到视频中，生成 out_path。"""
     # 使用字幕过滤烧录（ass/utf-8 支持取决于 ffmpeg 构建），这里强制转码 srt 为 UTF-8 临时文件以保证兼容性
     tmp_srt = srt_path + ".utf8.srt"
@@ -69,12 +106,28 @@ def burn_subtitles(video_path, srt_path, out_path):
         abs_tmp = os.path.abspath(tmp_srt)
         vf_arg = f"subtitles='{escape_subtitles_path(abs_tmp)}'"
 
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vf", vf_arg,
-            "-c:a", "copy",
-            out_path
-        ]
+        hwaccel_args = get_ffmpeg_hwaccel_args(no_hwaccel)
+        cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", video_path]
+        # 仅在未禁用硬件加速的情况下使用硬件加速编码
+        if not no_hwaccel:
+            # 设置视频编码器使用硬件加速（如果系统支持）
+            system = platform.system()
+            if system == "Linux":
+                # Linux使用硬件加速编码
+                cmd.extend(["-c:v", "h264_nvenc" if "nvidia" in " ".join(hwaccel_args) else "h264_vaapi"])
+            elif system == "Windows":
+                # Windows使用硬件加速编码
+                cmd.extend(["-c:v", "h264_qsv"])  # Intel QSV (快速解码重编码)
+            elif system == "Darwin":  # macOS
+                # macOS使用硬件加速编码
+                cmd.extend(["-c:v", "h264_videotoolbox"])
+            else:
+                # 其他系统使用软件编码
+                cmd.extend(["-c:v", "libx264"])
+        else:
+            # 软件编码
+            cmd.extend(["-c:v", "libx264"])
+        cmd.extend(["-vf", vf_arg, "-c:a", "copy", out_path])
         subprocess.run(cmd, check=True)
         print(f"已生成带字幕视频: {out_path}")
     except subprocess.CalledProcessError as e:
@@ -117,11 +170,15 @@ def embed_soft_subtitles(video_path, srt_path, out_path):
     else:
         map_sub = ['-c:s', 'mov_text']
 
-    cmd = [
-        'ffmpeg', '-y', '-i', video_path, '-i', srt_path,
-        '-map', '0', '-map', '1',
-        '-c:v', 'copy', '-c:a', 'copy',
-    ] + map_sub + [out_path]
+    # 使用硬件加速进行软字幕嵌入
+    hwaccel_args = get_ffmpeg_hwaccel_args()
+    cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", video_path, "-i", srt_path]
+    cmd.extend([
+        "-map", "0", "-map", "1",
+        # 视频流复制（保持原始编码），但使用硬件加速处理
+        "-c:v", "copy",
+        "-c:a", "copy",
+    ] + map_sub + [out_path])
 
     try:
         subprocess.run(cmd, check=True)
@@ -135,7 +192,17 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="If set, overwrite the original video with the subtitled version (safe replace)")
     parser.add_argument("--embed-mode", choices=["burn", "soft", "both"], default="burn",
                         help="Subtitle embedding mode: 'burn' = hardcode subtitles into video (default), 'soft' = add as separate subtitle track, 'both' = generate both.")
+    parser.add_argument("--no-hwaccel", action="store_true", help="Disable hardware acceleration")
     args = parser.parse_args()
+
+    # 检测和打印硬件加速状态
+    has_hwaccel_support = test_ffmpeg_hwaccel()
+    if args.no_hwaccel:
+        print("已禁用硬件加速")
+    elif has_hwaccel_support:
+        print(f"检测到硬件加速支持 ({platform.system()})")
+    else:
+        print("未检测到硬件加速支持，使用软件处理")
     targets = []
     if args.video_file:
         targets = [args.video_file]
@@ -153,7 +220,7 @@ def main():
 
         try:
             print("  正在提取音频...")
-            extract_audio(video_path, audio_path)
+            extract_audio(video_path, audio_path, args.no_hwaccel)
             print("  正在转录...")
             transcription = transcribe(audio_path)
             print("  正在保存 SRT 字幕...")
@@ -176,7 +243,7 @@ def main():
                     os.close(tmp_fd)
                     try:
                         if args.embed_mode in ("burn", "both"):
-                            burn_subtitles(video_path, srt_path, tmp_path)
+                            burn_subtitles(video_path, srt_path, tmp_path, args.no_hwaccel)
                         else:
                             embed_soft_subtitles(video_path, srt_path, tmp_path)
                         os.replace(tmp_path, video_path)
@@ -197,7 +264,7 @@ def main():
                     original_name = os.path.basename(video_path)
                     subbed_out = os.path.join(out_dir, original_name)
                     if args.embed_mode == "burn":
-                        burn_subtitles(video_path, srt_path, subbed_out)
+                        burn_subtitles(video_path, srt_path, subbed_out, args.no_hwaccel)
                         print(f"  已生成带字幕视频 (烧录): {subbed_out}")
                     elif args.embed_mode == "soft":
                         embed_soft_subtitles(video_path, srt_path, subbed_out)
@@ -208,7 +275,7 @@ def main():
                         print(f"  已生成带外挂字幕视频: {subbed_out}")
                         # 再产出烧录版本，带后缀以免覆盖
                         burned_name = os.path.join(out_dir, os.path.splitext(original_name)[0] + "_burned" + os.path.splitext(original_name)[1])
-                        burn_subtitles(video_path, srt_path, burned_name)
+                        burn_subtitles(video_path, srt_path, burned_name, args.no_hwaccel)
                         print(f"  已生成带烧录字幕视频: {burned_name}")
             except Exception as e:
                 print(f"  嵌入字幕时出错: {e}")
