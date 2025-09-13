@@ -52,15 +52,15 @@ def burn_subtitles(video_path, srt_path, out_path):
     try:
         with open(srt_path, "r", encoding="utf-8", errors="replace") as src, open(tmp_srt, "w", encoding="utf-8") as dst:
             dst.write(src.read())
-        # ffmpeg subtitles filter expects a path that may contain special characters.
-        # For Windows paths (which contain backslashes and colons) we need to escape
-        # backslashes and colons, and also wrap the whole argument in single quotes
-        # when passing via -vf. Example: subtitles='E\:\\path\\to\\file.srt'
+        # ffmpeg 字幕过滤器期望一个可能包含特殊字符的路径
+        # 对于 Windows 路径（包含反斜杠和冒号），我们需要转义
+        # 反斜杠和冒号，并且在使用 -vf 传递时需要用单引号包裹整个参数
+        # 示例: subtitles='E\:\\path\\to\\file.srt'
         def escape_subtitles_path(p):
-            # ffmpeg filter parsing: escape backslash and colon
+            # ffmpeg 过滤器解析：转义反斜杠和冒号
             escaped = p.replace("\\", "\\\\")
             escaped = escaped.replace(":", "\\:")
-            # also escape single quotes by closing and using '\'' sequence
+            # 同样转义单引号，通过关闭和使用 '\'' 序列
             if "'" in escaped:
                 escaped = escaped.replace("'", "\\'")
             return escaped
