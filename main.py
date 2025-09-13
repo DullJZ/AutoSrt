@@ -11,11 +11,87 @@ GROQ_API_KEY = "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"
 
 
 
+
+def get_video_info(video_path):
+    """获取视频文件信息，包括码率、时长等"""
+    try:
+        # 使用 ffprobe 获取视频信息
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=bit_rate,duration,width,height",
+            "-of", "json", video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            if "streams" and len(info["streams"]) > 0:
+                stream = info["streams"][0]
+                bitrate = int(stream.get("bit_rate", 0))
+                duration = float(stream.get("duration", 0))
+                width = int(stream.get("width", 0))
+                height = int(stream.get("height", 0))
+
+                # 如果码率为0，尝试从格式信息获取
+                if bitrate == 0:
+                    cmd2 = ["ffprobe", "-v", "error", "-show_entries", "format=bit_rate",
+                           "-of", "json", video_path]
+                    result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=30)
+                    if result2.returncode == 0:
+                        format_info = json.loads(result2.stdout)
+                        bitrate = int(format_info.get("format", {}).get("bit_rate", 0))
+
+                return {
+                    "bitrate": bitrate,
+                    "duration": duration,
+                    "width": width,
+                    "height": height,
+                    "size": os.path.getsize(video_path) if os.path.exists(video_path) else 0
+                }
+    except Exception as e:
+        print(f"获取视频信息失败: {e}")
+
+    return None
+
+def calculate_bitrate(video_info):
+    """根据视频信息和目标质量计算合适的输出码率"""
+    if not video_info or video_info["duration"] == 0:
+        return None
+
+    original_bitrate = video_info["bitrate"]
+
+    # 如果无法获取原始码率，使用基于分辨率的默认码率
+    if original_bitrate == 0:
+        resolution = video_info["width"] * video_info["height"]
+        if resolution >= 3840 * 2160:  # 4K
+            original_bitrate = 20_000_000  # 20 Mbps
+        elif resolution >= 1920 * 1080:  # 1080p
+            original_bitrate = 8_000_000  # 8 Mbps
+        elif resolution >= 1280 * 720:  # 720p
+            original_bitrate = 4_000_000  # 4 Mbps
+        else:
+            original_bitrate = 2_000_000  # 2 Mbps
+
+    # 根据分辨率调整目标码率
+    if video_info["width"] * video_info["height"] >= 3840 * 2160:  # 4K
+        target_bitrate = original_bitrate
+        max_bitrate = target_bitrate * 1.2
+        buffer_size = max_bitrate * 0.5
+    elif video_info["width"] * video_info["height"] >= 1920 * 1080:  # 1080p
+        target_bitrate = original_bitrate
+        max_bitrate = target_bitrate * 1.2
+        buffer_size = max_bitrate * 0.5
+    else:
+        target_bitrate = original_bitrate
+        max_bitrate = target_bitrate * 1.2
+        buffer_size = max_bitrate * 0.5
+
+    return {
+        "bitrate": int(target_bitrate),
+        "max_bitrate": int(max_bitrate),
+        "buffer_size": int(buffer_size)
+    }
+
 def get_ffmpeg_hwaccel_args(no_hwaccel=False):
-    """获取硬件加速参数
-    - Linux/Windows: 使用GPU加速
-    - macOS: 使用VideoToolbox(MIPS加速)
-    """
     if no_hwaccel:
         return []
 
@@ -82,8 +158,20 @@ def save_srt(transcription, srt_path):
             text = seg["text"].strip()
             f.write(f"{idx}\n{start} --> {end}\n{text}\n\n")
 
+
 def burn_subtitles(video_path, srt_path, out_path, no_hwaccel=False):
     """使用 ffmpeg 将 SRT 烧录到视频中，生成 out_path。"""
+
+    # 获取原视频信息用于码率计算
+    video_info = get_video_info(video_path)
+    if video_info:
+        print(f"原视频信息: 分辨率 {video_info['width']}x{video_info['height']}, "
+              f"码率: {video_info['bitrate']//1000 if video_info['bitrate'] > 0 else '未知'} kbps, "
+              f"大小: {video_info['size']/1024/1024:.1f} MB")
+
+    # 根据原视频计算输出码率
+    bitrate_settings = calculate_bitrate(video_info) if video_info else None
+
     # 使用字幕过滤烧录（ass/utf-8 支持取决于 ffmpeg 构建），这里强制转码 srt 为 UTF-8 临时文件以保证兼容性
     tmp_srt = srt_path + ".utf8.srt"
     try:
@@ -127,7 +215,24 @@ def burn_subtitles(video_path, srt_path, out_path, no_hwaccel=False):
         else:
             # 软件编码
             cmd.extend(["-c:v", "libx264"])
+
+        # 设置视频码率参数（基于原视频码率计算）
+        if bitrate_settings:
+            cmd.extend([
+                "-b:v", f"{bitrate_settings['bitrate'] // 1000}k",
+                "-maxrate", f"{bitrate_settings['max_bitrate'] // 1000}k",
+                "-bufsize", f"{bitrate_settings['buffer_size'] // 1000}k"
+            ])
+            print(f"设置视频码率: {bitrate_settings['bitrate'] // 1000} kbps (最大: {bitrate_settings['max_bitrate'] // 1000} kbps)")
+        else:
+            # 默认设置（如果无法获取原视频信息）
+            cmd.extend([
+                "-crf", "23",  # 默认质量参数
+                "-preset", "medium"  # 编码速度和质量的平衡
+            ])
+
         cmd.extend(["-vf", vf_arg, "-c:a", "copy", out_path])
+        print(f"执行命令: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
         print(f"已生成带字幕视频: {out_path}")
     except subprocess.CalledProcessError as e:
