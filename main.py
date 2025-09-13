@@ -9,9 +9,6 @@ from groq import Groq
 
 GROQ_API_KEY = "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"
 
-
-
-
 def get_video_info(video_path):
     """获取视频文件信息，包括码率、时长等"""
     try:
@@ -130,7 +127,7 @@ def extract_audio(video_path, audio_path, no_hwaccel=False):
     subprocess.run(cmd, check=True)
 
 def transcribe(audio_path):
-    client = Groq(api_key=GROQ_API_KEY)
+    client = Groq(api_key=GROQ_API_KEY, timeout=300)
     with open(audio_path, "rb") as file:
         transcription = client.audio.transcriptions.create(
             file=file,
