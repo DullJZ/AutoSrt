@@ -216,7 +216,8 @@ def extract_audio(video_path, audio_path, no_hwaccel=False):
     hwaccel_args = get_ffmpeg_hwaccel_args(no_hwaccel)
     cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", video_path]
     # 音频处理不使用硬件加速以保证兼容性
-    cmd.extend(["-vn", "-acodec", "mp3", "-q:a", "2", audio_path])
+    # 使用FLAC格式：16kHz采样率、单声道、FLAC编码
+    cmd.extend(["-vn", "-ar", "16000", "-ac", "1", "-map", "0:a", "-c:a", "flac", audio_path])
     subprocess.run(cmd, check=True)
 
 def transcribe(audio_path, max_retries=3):
@@ -498,7 +499,7 @@ def main():
     for video_path in targets:
         print(f"处理: {video_path}")
         base = os.path.splitext(video_path)[0]
-        audio_path = base + ".mp3"
+        audio_path = base + ".flac"
         srt_path = base + ".srt"
 
         try:
