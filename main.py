@@ -1,3 +1,4 @@
+import base64
 import os
 import sys
 import subprocess
@@ -241,6 +242,29 @@ def get_audio_duration(audio_path):
     except Exception as e:
         print(f"获取音频时长失败: {e}")
     return None
+
+def extract_audio(video_path, audio_path, no_hwaccel=False):
+    # 使用 ffmpeg 提取音频（可选择硬件加速）
+    hwaccel_args = get_ffmpeg_hwaccel_args(no_hwaccel)
+    cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", video_path]
+
+    # 获取原视频音轨采样率
+    original_sample_rate = get_audio_sampling_rate(video_path)
+
+    if original_sample_rate:
+        print(f"  原视频音轨采样率: {original_sample_rate}Hz")
+        # 如果原视频采样率低于16kHz，使用原采样率，否则保持16kHz上限
+        target_sample_rate = min(original_sample_rate, 16000)
+    else:
+        # 无法获取原采样率时，默认使用16kHz
+        target_sample_rate = 16000
+        print(f"  无法获取原采样率，使用默认: {target_sample_rate}Hz")
+
+    # 音频处理不使用硬件加速以保证兼容性
+    # 使用FLAC格式：自适应或16kHz采样率、单声道、16bit、FLAC编码（最高压缩级别）
+    cmd.extend(["-vn", "-ar", str(target_sample_rate), "-ac", "1", "-sample_fmt", "s16", "-map", "0:a", "-c:a", "flac",
+                "-compression_level", "8", "-frame_size", "4096", audio_path])
+    subprocess.run(cmd, check=True)
 
 def slice_audio(audio_path, output_dir, chunk_duration=1800, overlap=10):
     """切片音频：每30分钟（1800秒）为一块，中间重叠10秒"""
