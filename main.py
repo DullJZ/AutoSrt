@@ -228,34 +228,138 @@ def get_audio_sampling_rate(video_path):
         print(f"获取音轨采样率失败: {e}")
     return None
 
-def extract_audio(video_path, audio_path, no_hwaccel=False):
-    # 使用 ffmpeg 提取音频（可选择硬件加速）
-    hwaccel_args = get_ffmpeg_hwaccel_args(no_hwaccel)
-    cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", video_path]
+def get_audio_duration(audio_path):
+    """获取音频文件时长（秒）"""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
+               "-show_entries", "format=duration", "-of", "json", audio_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            duration = float(info.get("format", {}).get("duration", 0))
+            return duration
+    except Exception as e:
+        print(f"获取音频时长失败: {e}")
+    return None
 
-    # 获取原视频音轨采样率
-    original_sample_rate = get_audio_sampling_rate(video_path)
+def slice_audio(audio_path, output_dir, chunk_duration=1800, overlap=10):
+    """切片音频：每30分钟（1800秒）为一块，中间重叠10秒"""
+    try:
+        duration = get_audio_duration(audio_path)
+        if not duration:
+            print("无法获取音频时长，无法进行切片")
+            return []
 
-    if original_sample_rate:
-        print(f"  原视频音轨采样率: {original_sample_rate}Hz")
-        # 如果原视频采样率低于16kHz，使用原采样率，否则保持16kHz上限
-        target_sample_rate = min(original_sample_rate, 16000)
-    else:
-        # 无法获取原采样率时，默认使用16kHz
-        target_sample_rate = 16000
-        print(f"  无法获取原采样率，使用默认: {target_sample_rate}Hz")
+        base_name = os.path.basename(os.path.splitext(audio_path)[0])
+        chunks = []
 
-    # 音频处理不使用硬件加速以保证兼容性
-    # 使用FLAC格式：自适应或16kHz采样率、单声道、FLAC编码（最高压缩级别）
-    cmd.extend(["-vn", "-ar", str(target_sample_rate), "-ac", "1", "-map", "0:a", "-c:a", "flac",
-                "-compression_level", "8", "-frame_size", "4096", audio_path])
-    subprocess.run(cmd, check=True)
+        segment_count = 0
+        while segment_count * chunk_duration < duration:
+            start_time = max(0, segment_count * chunk_duration - overlap if segment_count > 0 else 0)
+            # 确保每个段至少有10秒重叠（除了第一段）
+            if segment_count == 0:
+                current_chunk_duration = min(chunk_duration, duration)
+            else:
+                remaining = duration - (segment_count * chunk_duration)
+                current_chunk_duration = min(chunk_duration + overlap, remaining + overlap)
 
-def transcribe(audio_path, max_retries=3):
+            chunk_path = os.path.join(output_dir, f"{base_name}_chunk{segment_count:03d}.flac")
+
+            cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ss", str(start_time), "-t", str(current_chunk_duration),
+                "-c:a", "flac", "-compression_level", "8", "-sample_fmt", "s16",
+                "-ar", "16000", "-ac", "1", "-map", "0:a", chunk_path
+            ]
+
+            subprocess.run(cmd, check=True, capture_output=True)
+            chunks.append(chunk_path)
+            print(f"  音频切片 {segment_count}: {start_time:.1f}s - {start_time + current_chunk_duration:.1f}s")
+
+            segment_count += 1
+            if (segment_count - 1) * chunk_duration >= duration:
+                break
+
+        return chunks
+    except Exception as e:
+        print(f"音频切片失败: {e}")
+        return []
+
+def transcribe_segmented(audio_chunks, max_retries=3):
+    """分段转录音频块并合并结果，处理重叠部分"""
     import base64
     GROQ_API_KEY = base64.b64decode(GROQ_API_KEY_BASE64).decode('utf-8')
     client = Groq(api_key=GROQ_API_KEY, timeout=300)
 
+    combined_transcription = None
+    last_chunk_end_time = 0
+
+    for chunk_index, chunk_path in enumerate(audio_chunks):
+        print(f"  转录第 {chunk_index + 1} 段音频...")
+
+        # 转录当前段
+        chunk_transcription = transcribe_chunk(client, chunk_path, max_retries)
+        if not chunk_transcription:
+            continue
+
+        # 计算当前段时间偏移
+        chunk_duration = get_audio_duration(chunk_path)
+        if chunk_duration is None:
+            chunk_duration = 1800  # 默认30分钟
+
+        actual_start_offset = max(0, chunk_index * 1800 - 10) if chunk_index > 0 else 0
+        overlap_duration = 10 if chunk_index > 0 else 0
+
+        # 调整时间戳
+        for segment in chunk_transcription.segments:
+            segment["start"] += actual_start_offset
+            segment["end"] += actual_start_offset
+
+        # 处理重叠部分：如果是第二段开始，跳过前10秒的内容以免重复
+        if chunk_index > 0 and overlap_duration > 0:
+            filtered_segments = [
+                seg for seg in chunk_transcription.segments
+                if seg["start"] >= actual_start_offset + overlap_duration
+            ]
+            if filtered_segments:
+                chunk_transcription.segments = filtered_segments
+
+        # 合并转录结果
+        if combined_transcription is None:
+            combined_transcription = chunk_transcription
+        else:
+            combined_transcription.segments.extend(chunk_transcription.segments)
+
+        last_chunk_end_time = max(seg["end"] for seg in chunk_transcription.segments) if chunk_transcription.segments else actual_start_offset
+
+    if combined_transcription is None:
+        return None
+
+    # 重新排序片段并确保时间序列正确
+    combined_transcription.segments.sort(key=lambda x: x["start"])
+
+    # 合并相邻的重叠或重复片段
+    merged_segments = []
+    current_segment = None
+    for segment in combined_transcription.segments:
+        if current_segment is None:
+            current_segment = segment.copy()
+        elif segment["start"] <= current_segment["end"] + 0.5:  # 允许0.5秒的重叠
+            # 合并重叠的片段
+            current_segment["end"] = max(current_segment["end"], segment["end"])
+            current_segment["text"] += " " + segment["text"].strip()
+        else:
+            merged_segments.append(current_segment)
+            current_segment = segment.copy()
+
+    if current_segment is not None:
+        merged_segments.append(current_segment)
+
+    combined_transcription.segments = merged_segments
+    return combined_transcription
+
+def transcribe_chunk(client, audio_path, max_retries=3):
+    """转录单个音频块"""
     for attempt in range(max_retries):
         try:
             with open(audio_path, "rb") as file:
@@ -269,17 +373,63 @@ def transcribe(audio_path, max_retries=3):
                     timestamp_granularities=["segment"],
                     temperature=0.0
                 )
+            print(f"  转录成功: {len(transcription.segments)} 个片段")
             return transcription
         except Exception as e:
-            print(f"转录失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            print(f"  转录失败 (尝试 {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 2
-                print(f"等待 {wait_time} 秒后重试...")
+                print(f"  等待 {wait_time} 秒后重试...")
                 time.sleep(wait_time)
             else:
                 raise
-
     return None
+
+# 原始转录函数修改 - 保持兼容，支持长音频切片
+def transcribe(audio_path, max_retries=3, use_segmentation=True):
+    import base64
+    GROQ_API_KEY = base64.b64decode(GROQ_API_KEY_BASE64).decode('utf-8')
+    client = Groq(api_key=GROQ_API_KEY, timeout=300)
+
+    # 如果音频较长，使用分段处理
+    if use_segmentation:
+        audio_duration = get_audio_duration(audio_path)
+        if audio_duration is None:
+            audio_duration = 0
+
+        # 如果音频超过25分钟，使用分段转录
+        if audio_duration > 1500:  # 25分钟 = 1500秒
+            print(f"音频时长 {audio_duration/60:.1f} 分钟，使用分段转录...")
+
+            # 创建临时切片目录
+            temp_dir = tempfile.mkdtemp(prefix="audio_chunks")
+            try:
+                # 切片音频
+                audio_chunks = slice_audio(audio_path, temp_dir, chunk_duration=1800, overlap=10)
+                print(f"已将音频切片为 {len(audio_chunks)} 个片段")
+
+                # 分段转录
+                if audio_chunks:
+                    result = transcribe_segmented(audio_chunks, max_retries)
+
+                    # 清理临时文件
+                    for chunk in audio_chunks:
+                        try:
+                            if os.path.exists(chunk):
+                                os.remove(chunk)
+                        except:
+                            pass
+                    try:
+                        os.rmdir(temp_dir)
+                    except:
+                        pass
+
+                    return result
+            except Exception as e:
+                print(f"分段转录失败: {e}，回退到整体转录")
+
+    # 短音频或分段失败时，使用整体转录
+    return transcribe_chunk(client, audio_path, max_retries)
 
 def srt_timestamp(seconds):
     h = int(seconds // 3600)
