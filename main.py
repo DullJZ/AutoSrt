@@ -5,6 +5,7 @@ import json
 import argparse
 import tempfile
 import platform
+import time
 from groq import Groq
 
 GROQ_API_KEY_BASE64 = "Z3NrX1pnSTB6THRqRTQzVEwzMloyaTVUV0dkeWIzRlljUWg4WDlOcnM4RkZudDVRN2EwSWt2cjc="
@@ -218,20 +219,33 @@ def extract_audio(video_path, audio_path, no_hwaccel=False):
     cmd.extend(["-vn", "-acodec", "mp3", "-q:a", "2", audio_path])
     subprocess.run(cmd, check=True)
 
-def transcribe(audio_path):
+def transcribe(audio_path, max_retries=3):
     import base64
     GROQ_API_KEY = base64.b64decode(GROQ_API_KEY_BASE64).decode('utf-8')
     client = Groq(api_key=GROQ_API_KEY, timeout=300)
-    with open(audio_path, "rb") as file:
-        transcription = client.audio.transcriptions.create(
-            file=file,
-            model="whisper-large-v3-turbo",
-            language="zh",
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-            temperature=0.0
-        )
-    return transcription
+
+    for attempt in range(max_retries):
+        try:
+            with open(audio_path, "rb") as file:
+                transcription = client.audio.transcriptions.create(
+                    file=file,
+                    model="whisper-large-v3-turbo",
+                    language="zh",
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                    temperature=0.0
+                )
+            return transcription
+        except Exception as e:
+            print(f"转录失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                print(f"等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            else:
+                raise
+
+    return None
 
 def srt_timestamp(seconds):
     h = int(seconds // 3600)
