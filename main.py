@@ -106,17 +106,109 @@ def get_ffmpeg_hwaccel_args(no_hwaccel=False):
         # 其他系统不启用硬件加速
         return []
 
-def test_ffmpeg_hwaccel():
-    """测试ffmpeg硬件加速是否可用"""
+
+def detect_available_gpu():
+    """检测系统可用的GPU硬件
+    Returns:
+        dict: 包含可用硬件信息，如 {'cuda': True, 'qsv': False, 'vaapi': True}
+    """
+    gpu_info = {'cuda': False, 'qsv': False, 'vaapi': False, 'nvenc': False}
+    system = platform.system()
+
     try:
-        # 尝试使用硬件加速执行一个简单的命令
-        test_cmd = ["ffmpeg", "-hwaccels"]
-        result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0 and "videotoolbox" in result.stdout or "cuda" in result.stdout or "qsv" in result.stdout:
-            return True
-    except:
-        pass
-    return False
+        # 检测ffmpeg支持的硬件加速方式
+        result = subprocess.run(["ffmpeg", "-hwaccels"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            output = result.stdout.lower()
+            gpu_info['cuda'] = 'cuda' in output
+            gpu_info['qsv'] = 'qsv' in output
+            gpu_info['vaapi'] = 'vaapi' in output
+
+        # 检测可用的编码器
+        result = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            output = result.stdout.lower()
+            gpu_info['nvenc'] = 'h264_nvenc' in output or 'hevc_nvenc' in output
+            gpu_info['qsv'] = gpu_info['qsv'] or ('h264_qsv' in output)
+            gpu_info['vaapi'] = gpu_info['vaapi'] or ('h264_vaapi' in output)
+
+        # Windows下检测DirectX设备（CUDA）
+        if system == "Windows":
+            try:
+                import win32api
+                # 检查NVIDIA GPU
+                try:
+                    win32api.RegOpenKey(win32api.HKEY_LOCAL_MACHINE, r'SOFTWARE\NVIDIA Corporation\GPU')
+                    gpu_info['cuda'] = True
+                except:
+                    pass
+
+                # 检查Intel GPU
+                try:
+                    win32api.RegOpenKey(win32api.HKEY_LOCAL_MACHINE, r'SOFTWARE\Intel\GMM')
+                    gpu_info['qsv'] = True
+                except:
+                    pass
+            except ImportError:
+                # 如果无法使用win32api，基于ffmpeg结果判断
+                pass
+
+    except Exception as e:
+        print(f"GPU检测失败: {e}")
+
+    return gpu_info
+
+def test_ffmpeg_hwaccel():
+    """测试ffmpeg硬件加速是否可用（兼容旧函数名）"""
+    gpu_info = get_gpu_info()
+    return any(gpu_info.values())
+
+# 全局缓存GPU信息以提升性能
+gpu_cache = None
+
+def get_gpu_info():
+    global gpu_cache
+    if gpu_cache is None:
+        gpu_cache = detect_available_gpu()
+    return gpu_cache
+
+def get_ffmpeg_hwaccel_args(no_hwaccel=False):
+    """获取硬件加速参数
+    Windows: 优先CUDA，其次QSV
+    Linux: 优先NVIDIA(CUDA)，其次AMD/Intel
+    macOS: 使用VideoToolbox
+    """
+    if no_hwaccel:
+        return []
+
+    gpu_info = get_gpu_info()
+    system = platform.system()
+    hwaccel_args = []
+
+    if system == "Windows":
+        # Windows优先CUDA，其次QSV
+        if gpu_info.get('cuda', False):
+            hwaccel_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        elif gpu_info.get('qsv', False):
+            hwaccel_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        else:
+            # 回退到软件处理
+            hwaccel_args = []
+
+    elif system == "Linux":
+        # Linux优先自动检测（支持AMD/NVIDIA/Intel）
+        if gpu_info.get('cuda', False):
+            hwaccel_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        elif gpu_info.get('vaapi', False):
+            hwaccel_args = ["-hwaccel", "vaapi", "-vaapi_device", "/dev/dri/renderD128"]
+        else:
+            hwaccel_args = ["-hwaccel", "auto"]  # 自动模式
+
+    elif system == "Darwin":  # macOS
+        # macOS使用VideoToolbox
+        hwaccel_args = ["-hwaccel", "videotoolbox"]
+
+    return hwaccel_args
 
 def extract_audio(video_path, audio_path, no_hwaccel=False):
     # 使用 ffmpeg 提取音频（可选择硬件加速）
@@ -195,16 +287,30 @@ def burn_subtitles(video_path, srt_path, out_path, no_hwaccel=False):
         cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", video_path]
         # 仅在未禁用硬件加速的情况下使用硬件加速编码
         if not no_hwaccel:
-            # 设置视频编码器使用硬件加速（如果系统支持）
+            gpu_info = get_gpu_info()
             system = platform.system()
-            if system == "Linux":
-                # Linux使用硬件加速编码
-                cmd.extend(["-c:v", "h264_nvenc" if "nvidia" in " ".join(hwaccel_args) else "h264_vaapi"])
-            elif system == "Windows":
-                # Windows使用硬件加速编码
-                cmd.extend(["-c:v", "h264_qsv"])  # Intel QSV (快速解码重编码)
+
+            if system == "Windows":
+                # Windows优先NVENC(CUDA)，其次QSV
+                if gpu_info.get('nvenc', False):
+                    cmd.extend(["-c:v", "h264_nvenc"])
+                elif gpu_info.get('qsv', False):
+                    cmd.extend(["-c:v", "h264_qsv"])
+                else:
+                    # 默认软件编码
+                    cmd.extend(["-c:v", "libx264"])
+
+            elif system == "Linux":
+                # Linux优先NVIDIA，其次AMD/Intel
+                if gpu_info.get('nvenc', False):
+                    cmd.extend(["-c:v", "h264_nvenc"])
+                elif gpu_info.get('vaapi', False):
+                    cmd.extend(["-c:v", "h264_vaapi"])
+                else:
+                    cmd.extend(["-c:v", "libx264"])
+
             elif system == "Darwin":  # macOS
-                # macOS使用硬件加速编码
+                # macOS使用VideoToolbox硬件加速
                 cmd.extend(["-c:v", "h264_videotoolbox"])
             else:
                 # 其他系统使用软件编码
@@ -298,13 +404,28 @@ def main():
     args = parser.parse_args()
 
     # 检测和打印硬件加速状态
-    has_hwaccel_support = test_ffmpeg_hwaccel()
+    gpu_info = get_gpu_info()
     if args.no_hwaccel:
         print("已禁用硬件加速")
-    elif has_hwaccel_support:
-        print(f"检测到硬件加速支持 ({platform.system()})")
     else:
-        print("未检测到硬件加速支持，使用软件处理")
+        system = platform.system()
+        if system == "Windows":
+            # Windows平台显示CUDA和QSV状态
+            gpu_status = []
+            if gpu_info.get('nvenc', False):
+                gpu_status.append("NVIDIA GPU")
+            if gpu_info.get('qsv', False):
+                gpu_status.append("Intel 核显")
+            if gpu_status:
+                print(f"Windows检测到硬件加速支持: {', '.join(gpu_status)}")
+            else:
+                print("Windows未检测到硬件加速支持，使用软件处理")
+        else:
+            # Linux和macOS的显示保持简洁
+            if any(gpu_info.values()):
+                print(f"检测到硬件加速支持 ({system})")
+            else:
+                print("未检测到硬件加速支持，使用软件处理")
     targets = []
     if args.video_file:
         targets = [args.video_file]
