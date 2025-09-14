@@ -266,8 +266,8 @@ def extract_audio(video_path, audio_path, no_hwaccel=False):
                 "-compression_level", "8", "-frame_size", "4096", audio_path])
     subprocess.run(cmd, check=True)
 
-def slice_audio(audio_path, output_dir, chunk_duration=1800, overlap=10):
-    """切片音频：每30分钟（1800秒）为一块，中间重叠10秒"""
+def slice_audio(audio_path, output_dir, chunk_duration=1200, overlap=10):
+    """切片音频：每20分钟（1200秒）为一块，中间重叠10秒"""
     try:
         duration = get_audio_duration(audio_path)
         if not duration:
@@ -309,14 +309,96 @@ def slice_audio(audio_path, output_dir, chunk_duration=1800, overlap=10):
         print(f"音频切片失败: {e}")
         return []
 
+def merge_srt_files(srt_files, output_path):
+    """合并多个SRT文件，重新编号和处理时间戳"""
+    from datetime import datetime, timedelta
+
+    merged_segments = []
+    segment_counter = 1
+
+    for srt_index, srt_file in enumerate(srt_files):
+        if not os.path.exists(srt_file):
+            print(f"  警告: SRT文件不存在: {srt_file}")
+            continue
+
+        try:
+            with open(srt_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+
+            # 解析SRT文件内容
+            blocks = content.split('\n\n')
+            for block in blocks:
+                lines = block.strip().split('\n')
+                if len(lines) >= 3:  # 序号、时间戳、文本
+                    # 解析时间戳行 (格式: 00:00:00,000 --> 00:00:05,000)
+                    time_line = lines[1]
+                    if '-->' in time_line:
+                        start_time_str, end_time_str = time_line.split('-->')
+                        start_time = parse_srt_time(start_time_str.strip())
+                        end_time = parse_srt_time(end_time_str.strip())
+
+                        # 获取文本内容（可能有多个文本行）
+                        text = ' '.join(lines[2:]).strip()
+
+                        merged_segments.append({
+                            'start': start_time,
+                            'end': end_time,
+                            'text': text
+                        })
+
+        except Exception as e:
+            print(f"  读取SRT文件 {srt_file} 失败: {e}")
+            continue
+
+    # 显示每个SRT文件的时间范围
+    if merged_segments:
+        first_start = min(s['start'] for s in merged_segments)
+        last_end = max(s['end'] for s in merged_segments)
+        print(f"  SRT文件时间范围: {first_start:.1f}s - {last_end:.1f}s (总时长: {last_end-first_start:.1f}s)")
+
+    # 排序并合并重叠部分
+    if not merged_segments:
+        return False
+
+    merged_segments.sort(key=lambda x: x['start'])
+
+    # 简化逻辑：只拼接不合并，仅重新编号
+    final_segments = merged_segments  # 已经排序完成
+    print(f"  拼接SRT片段，共 {len(final_segments)} 个片段")
+
+    # 写入合并后的SRT文件
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for idx, segment in enumerate(final_segments, 1):
+            start_time = format_srt_time(segment['start'])
+            end_time = format_srt_time(segment['end'])
+            f.write(f"{idx}\n{start_time} --> {end_time}\n{segment['text']}\n\n")
+
+    return True
+
+def parse_srt_time(time_str):
+    """解析SRT时间格式 '00:00:00,000' 为秒数"""
+    try:
+        time_part, ms_part = time_str.split(',')
+        h, m, s = time_part.split(':')
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms_part) / 1000
+    except:
+        return 0
+
+def format_srt_time(seconds):
+    """将秒数格式化为SRT时间格式"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
 def transcribe_segmented(audio_chunks, max_retries=3):
-    """分段转录音频块并合并结果，处理重叠部分"""
+    """分段转录音频块，为每个音频块生成独立的SRT文件"""
     import base64
     GROQ_API_KEY = base64.b64decode(GROQ_API_KEY_BASE64).decode('utf-8')
     client = Groq(api_key=GROQ_API_KEY, timeout=300)
 
-    combined_transcription = None
-    last_chunk_end_time = 0
+    generated_srt_files = []
 
     for chunk_index, chunk_path in enumerate(audio_chunks):
         print(f"  转录第 {chunk_index + 1} 段音频...")
@@ -329,9 +411,9 @@ def transcribe_segmented(audio_chunks, max_retries=3):
         # 计算当前段时间偏移
         chunk_duration = get_audio_duration(chunk_path)
         if chunk_duration is None:
-            chunk_duration = 1800  # 默认30分钟
+            chunk_duration = 1200  # 默认20分钟
 
-        actual_start_offset = max(0, chunk_index * 1800 - 10) if chunk_index > 0 else 0
+        actual_start_offset = max(0, chunk_index * 1200 - 10) if chunk_index > 0 else 0
         overlap_duration = 10 if chunk_index > 0 else 0
 
         # 调整时间戳
@@ -348,49 +430,22 @@ def transcribe_segmented(audio_chunks, max_retries=3):
             if filtered_segments:
                 chunk_transcription.segments = filtered_segments
 
-        # 合并转录结果
-        if combined_transcription is None:
-            combined_transcription = chunk_transcription
-        else:
-            combined_transcription.segments.extend(chunk_transcription.segments)
+        # 生成独立的SRT文件
+        base_name = os.path.splitext(os.path.basename(chunk_path))[0]
+        chunk_srt_path = os.path.join(os.path.dirname(chunk_path), f"{base_name}_part{chunk_index + 1}.srt")
+        save_srt(chunk_transcription, chunk_srt_path)
+        generated_srt_files.append(chunk_srt_path)
+        print(f"  第 {chunk_index + 1} 段SRT已生成: {chunk_srt_path} (共 {len(chunk_transcription.segments)} 个片段)")
 
-        last_chunk_end_time = max(seg["end"] for seg in chunk_transcription.segments) if chunk_transcription.segments else actual_start_offset
-
-    if combined_transcription is None:
-        return None
-
-    # 重新排序片段并确保时间序列正确
-    combined_transcription.segments.sort(key=lambda x: x["start"])
-
-    # 合并相邻的重叠或重复片段
-    merged_segments = []
-    current_segment = None
-    for segment in combined_transcription.segments:
-        if current_segment is None:
-            current_segment = segment.copy()
-        elif segment["start"] <= current_segment["end"] + 0.5:  # 允许0.5秒的重叠
-            # 合并重叠的片段
-            current_segment["end"] = max(current_segment["end"], segment["end"])
-            current_segment["text"] += " " + segment["text"].strip()
-        else:
-            merged_segments.append(current_segment)
-            current_segment = segment.copy()
-
-    if current_segment is not None:
-        merged_segments.append(current_segment)
-
-    combined_transcription.segments = merged_segments
-    return combined_transcription
+    return generated_srt_files
 
 def transcribe_chunk(client, audio_path, max_retries=3):
     """转录单个音频块"""
     for attempt in range(max_retries):
         try:
             with open(audio_path, "rb") as file:
-                flac_data = file.read()
-                flac_base64 = "data:audio/flac;base64," + base64.b64encode(flac_data).decode('utf-8')
                 transcription = client.audio.transcriptions.create(
-                    url=flac_base64,
+                    file=file,
                     model="whisper-large-v3-turbo",
                     language="zh",
                     response_format="verbose_json",
@@ -409,7 +464,7 @@ def transcribe_chunk(client, audio_path, max_retries=3):
                 raise
     return None
 
-# 原始转录函数修改 - 保持兼容，支持长音频切片
+# 原始转录函数修改 - 支持长音频切片，生成独立SRT文件后再合并
 def transcribe(audio_path, max_retries=3, use_segmentation=True):
     import base64
     GROQ_API_KEY = base64.b64decode(GROQ_API_KEY_BASE64).decode('utf-8')
@@ -423,18 +478,71 @@ def transcribe(audio_path, max_retries=3, use_segmentation=True):
 
         # 如果音频超过25分钟，使用分段转录
         if audio_duration > 1500:  # 25分钟 = 1500秒
-            print(f"音频时长 {audio_duration/60:.1f} 分钟，使用分段转录...")
-
-            # 创建临时切片目录
-            temp_dir = tempfile.mkdtemp(prefix="audio_chunks")
             try:
+                print(f"音频时长 {audio_duration/60:.1f} 分钟，使用分段转录...")
+
+                # 创建临时切片目录
+                temp_dir = "tmp"
+                try:
+                    os.makedirs(temp_dir, exist_ok=True)
+                except:
+                    pass
+
                 # 切片音频
-                audio_chunks = slice_audio(audio_path, temp_dir, chunk_duration=1800, overlap=10)
+                audio_chunks = slice_audio(audio_path, temp_dir, chunk_duration=1200, overlap=10)
                 print(f"已将音频切片为 {len(audio_chunks)} 个片段")
 
-                # 分段转录
+                # 分段转录，生成独立的SRT文件
                 if audio_chunks:
-                    result = transcribe_segmented(audio_chunks, max_retries)
+                    srt_files = transcribe_segmented(audio_chunks, max_retries)
+
+                    # 合并SRT文件
+                    if len(srt_files) > 1:
+                        base_name = os.path.splitext(audio_path)[0]
+                        merged_srt_path = base_name + ".srt"
+                        if merge_srt_files(srt_files, merged_srt_path):
+                            print(f"已合并SRT文件: {merged_srt_path}")
+                        else:
+                            print("合并SRT文件失败")
+                    elif len(srt_files) == 1:
+                        base_name = os.path.splitext(audio_path)[0]
+                        merged_srt_path = base_name + ".srt"
+                        try:
+                            import shutil
+                            shutil.copy(srt_files[0], merged_srt_path)
+                            print(f"单段转录，SRT文件已保存: {merged_srt_path}")
+                        except Exception as e:
+                            print(f"复制SRT文件失败: {e}")
+
+                    # 创建一个模拟的结果对象返回
+                    class MockTranscription:
+                        def __init__(self):
+                            self.segments = []
+
+                    result = MockTranscription()
+
+                    # 读取合并后的SRT文件内容，构建segments
+                    try:
+                        with open(merged_srt_path, 'r', encoding='utf-8') as f:
+                            content = f.read().strip().split('\n\n')
+                            for block in content:
+                                lines = block.strip().split('\n')
+                                if len(lines) >= 3:
+                                    time_line = lines[1]
+                                    if '-->' in time_line:
+                                        start_str, end_str = time_line.split('-->')
+                                        start_time = parse_srt_time(start_str.strip())
+                                        end_time = parse_srt_time(end_str.strip())
+                                        text = ' '.join(lines[2:]).strip()
+
+                                        result.segments.append({
+                                            'start': start_time,
+                                            'end': end_time,
+                                            'text': text
+                                        })
+                        print(f"  合并后的SRT包含 {len(result.segments)} 个片段")
+                    except Exception as e:
+                        print(f"  读取合并后的SRT文件失败: {e}")
 
                     # 清理临时文件
                     for chunk in audio_chunks:
@@ -443,10 +551,22 @@ def transcribe(audio_path, max_retries=3, use_segmentation=True):
                                 os.remove(chunk)
                         except:
                             pass
-                    try:
-                        os.rmdir(temp_dir)
-                    except:
-                        pass
+
+                    # 保留分段SRT文件用于调试（不再清理）
+                    print(f"  分段SRT文件保留用于调试: {srt_files}")
+                    # for srt_file in srt_files:
+                    #     try:
+                    #         if os.path.exists(srt_file):
+                    #             os.remove(srt_file)
+                    #     except:
+                    #         pass
+
+                    # 保留tmp目录用于调试
+                    print(f"  临时目录保留用于调试: {temp_dir}")
+                    # try:
+                    #     os.rmdir(temp_dir)
+                    # except:
+                    #     pass
 
                     return result
             except Exception as e:
