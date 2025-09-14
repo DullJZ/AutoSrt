@@ -211,13 +211,44 @@ def get_ffmpeg_hwaccel_args(no_hwaccel=False):
 
     return hwaccel_args
 
+def get_audio_sampling_rate(video_path):
+    """获取视频中音轨的采样率"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate", "-of", "json", video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            if info.get("streams") and len(info["streams"]) > 0:
+                sample_rate = int(info["streams"][0].get("sample_rate", 0))
+                return sample_rate
+    except Exception as e:
+        print(f"获取音轨采样率失败: {e}")
+    return None
+
 def extract_audio(video_path, audio_path, no_hwaccel=False):
     # 使用 ffmpeg 提取音频（可选择硬件加速）
     hwaccel_args = get_ffmpeg_hwaccel_args(no_hwaccel)
     cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", video_path]
+
+    # 获取原视频音轨采样率
+    original_sample_rate = get_audio_sampling_rate(video_path)
+
+    if original_sample_rate:
+        print(f"  原视频音轨采样率: {original_sample_rate}Hz")
+        # 如果原视频采样率低于16kHz，使用原采样率，否则保持16kHz上限
+        target_sample_rate = min(original_sample_rate, 16000)
+    else:
+        # 无法获取原采样率时，默认使用16kHz
+        target_sample_rate = 16000
+        print(f"  无法获取原采样率，使用默认: {target_sample_rate}Hz")
+
     # 音频处理不使用硬件加速以保证兼容性
-    # 使用FLAC格式：16kHz采样率、单声道、FLAC编码
-    cmd.extend(["-vn", "-ar", "16000", "-ac", "1", "-map", "0:a", "-c:a", "flac", audio_path])
+    # 使用FLAC格式：自适应或16kHz采样率、单声道、FLAC编码（最高压缩级别）
+    cmd.extend(["-vn", "-ar", str(target_sample_rate), "-ac", "1", "-map", "0:a", "-c:a", "flac",
+                "-compression_level", "8", "-frame_size", "4096", audio_path])
     subprocess.run(cmd, check=True)
 
 def transcribe(audio_path, max_retries=3):
