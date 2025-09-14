@@ -366,12 +366,51 @@ def burn_subtitles(video_path, srt_path, out_path, no_hwaccel=False):
         except Exception:
             pass
 
+def load_processed_videos():
+    """从JSON文件加载已处理的视频列表"""
+    processed_file = "processed_videos.json"
+    if os.path.exists(processed_file):
+        try:
+            with open(processed_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"读取已处理视频列表失败: {e}")
+            return {}
+    return {}
+
+def save_processed_videos(processed_dict):
+    """保存已处理的视频列表到JSON文件"""
+    processed_file = "processed_videos.json"
+    try:
+        with open(processed_file, 'w', encoding='utf-8') as f:
+            json.dump(processed_dict, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存已处理视频列表失败: {e}")
+
+def clear_processed_videos():
+    """清空已处理的视频列表"""
+    try:
+        if os.path.exists("processed_videos.json"):
+            os.remove("processed_videos.json")
+            print("已清空已处理视频列表")
+        else:
+            print("已处理视频列表不存在")
+    except Exception as e:
+        print(f"清空已处理视频列表失败: {e}")
+
 def find_videos_in_cwd():
+    """扫描当前目录下的视频文件，排除已处理的视频"""
     exts = {'.mp4', '.mkv', '.mov', '.avi', '.flv', '.webm'}
     files = []
+    processed_videos = load_processed_videos()
+
     for f in sorted(os.listdir(os.getcwd())):
         if os.path.isfile(f) and os.path.splitext(f)[1].lower() in exts:
-            files.append(os.path.abspath(f))
+            abs_path = os.path.abspath(f)
+            if abs_path not in processed_videos:
+                files.append(abs_path)
+            else:
+                print(f"跳过已处理的视频: {f}")
     return files
 
 
@@ -417,7 +456,12 @@ def main():
     parser.add_argument("--embed-mode", choices=["burn", "soft", "both"], default="burn",
                         help="Subtitle embedding mode: 'burn' = hardcode subtitles into video (default), 'soft' = add as separate subtitle track, 'both' = generate both.")
     parser.add_argument("--no-hwaccel", action="store_true", help="Disable hardware acceleration")
+    parser.add_argument("--reset-processed", action="store_true", help="重置已处理的视频列表（仅在批量处理模式下有效）")
     args = parser.parse_args()
+
+    # 处理重置已处理视频列表
+    if args.reset_processed and not args.video_file:
+        clear_processed_videos()
 
     # 检测和打印硬件加速状态
     gpu_info = get_gpu_info()
@@ -520,6 +564,18 @@ def main():
                 print(f"  嵌入字幕时出错: {e}")
         except Exception as e:
             print(f"处理 {video_path} 时发生错误: {e}")
+        else:
+            # 处理成功，将视频添加到已处理列表
+            if not args.video_file:  # 只在批量处理模式下记录
+                processed_videos = load_processed_videos()
+                processed_videos[video_path] = {
+                    "processed_at": time.time(),
+                    "srt_path": srt_path,
+                    "embed_mode": args.embed_mode
+                }
+                save_processed_videos(processed_videos)
+                print(f"  已记录到已处理视频列表")
+
 
 if __name__ == "__main__":
     main()
