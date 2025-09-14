@@ -8,7 +8,7 @@ import platform
 import time
 from groq import Groq
 
-GROQ_API_KEY_BASE64 = "Z3NrX1pnSTB6THRqRTQzVEwzMloyaTVUV0dkeWIzRlljUWg4WDlOcnM4RkZudDVRN2EwSWt2cjc="
+GROQ_API_KEY_BASE64 = "Z3NrX2JPSjlLMVVZVUtUalc3dGJNQ0FEV0dkeWIzRllLejRQdnpqbTd5blpsd3ZHdE5ITUhFNDU="
 
 def get_video_info(video_path):
     """获取视频文件信息，包括码率、时长等"""
@@ -259,8 +259,10 @@ def transcribe(audio_path, max_retries=3):
     for attempt in range(max_retries):
         try:
             with open(audio_path, "rb") as file:
+                flac_data = file.read()
+                flac_base64 = "data:audio/flac;base64," + base64.b64encode(flac_data).decode('utf-8')
                 transcription = client.audio.transcriptions.create(
-                    file=file,
+                    url=flac_base64,
                     model="whisper-large-v3-turbo",
                     language="zh",
                     response_format="verbose_json",
